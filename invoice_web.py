@@ -118,7 +118,10 @@ st.markdown('</div>', unsafe_allow_html=True)
 st.markdown('<div class="section-box"><div class="section-title">📝 明細（最大16行）</div>', unsafe_allow_html=True)
 st.caption("※ 税区分: 10% = 標準税率 ／ 8% = 軽減税率 ／ 非課税")
 
-# セッション初期化
+# セッション初期化（item_editorキーの古いデータも除去）
+if "item_editor" in st.session_state:
+    del st.session_state["item_editor"]
+
 if "items" not in st.session_state or not isinstance(st.session_state.items, list):
     st.session_state.items = empty_items()
 
