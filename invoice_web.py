@@ -58,31 +58,6 @@ st.caption("※ 税区分: 10% = 標準税率 ／ 8% = 軽減税率 ／ 非課�
 if "items" not in st.session_state or not isinstance(st.session_state["items"], list) or len(st.session_state["items"]) == 0:
     st.session_state["items"] = empty_items()
 
-df = pd.DataFrame(st.session_state["items"], columns=COLS)
-for col in COLS:
-    if col not in df.columns:
-        df[col] = None
-df = df[COLS]
-
-edited = st.data_editor(
-    df,
-    column_config={
-        "税区分": st.column_config.SelectboxColumn("税区分", options=TAX_OPTIONS, default="10%", width="small"),
-        "品番": st.column_config.TextColumn("品番", width="small"),
-        "品名": st.column_config.TextColumn("品名", width="large"),
-        "数量": st.column_config.NumberColumn("数量", min_value=0, format="%.0f", width="small"),
-        "単位": st.column_config.TextColumn("単位", width="small"),
-        "単価": st.column_config.NumberColumn("単価", min_value=0, format="%.0f", width="medium"),
-    },
-    width="stretch",
-    num_rows="fixed",
-    hide_index=True,
-    key="item_editor_v3",
-)
-
-# ── edited の結果を即座にセッションへ保存（消える問題の防止）──
-new_items = edited.to_dict("records")
-# NaN を None に正規化してからセッションへ
 def normalize_row(row):
     out = {}
     for k, v in row.items():
@@ -91,42 +66,76 @@ def normalize_row(row):
         else:
             out[k] = v
     return out
-st.session_state["items"] = [normalize_row(r) for r in new_items]
 
-# ── Enterキー → Tab（横移動）に変換する JS ──
-st.components.v1.html("""
+@st.fragment
+def render_editor():
+    df = pd.DataFrame(st.session_state["items"], columns=COLS)
+    for col in COLS:
+        if col not in df.columns:
+            df[col] = None
+    df = df[COLS]
+
+    edited = st.data_editor(
+        df,
+        column_config={
+            "税区分": st.column_config.SelectboxColumn("税区分", options=TAX_OPTIONS, default="10%", width="small"),
+            "品番": st.column_config.TextColumn("品番", width="small"),
+            "品名": st.column_config.TextColumn("品名", width="large"),
+            "数量": st.column_config.NumberColumn("数量", min_value=0, format="%.0f", width="small"),
+            "単位": st.column_config.TextColumn("単位", width="small"),
+            "単価": st.column_config.NumberColumn("単価", min_value=0, format="%.0f", width="medium"),
+        },
+        width="stretch",
+        num_rows="fixed",
+        hide_index=True,
+        key="item_editor_v3",
+    )
+    st.session_state["items"] = [normalize_row(r) for r in edited.to_dict("records")]
+
+    # ── Enterキー → Tab（右移動）変換JS ──
+    # data_editorはiframe内でglide-data-gridを使用。
+    # keydownをキャプチャして Enter を Tab に差し替える。
+    st.components.v1.html("""
 <script>
 (function() {
-  function patchDataEditor() {
-    const tables = window.parent.document.querySelectorAll('[data-testid="stDataFrame"] [role="grid"], .dvn-scroller [role="grid"]');
-    if (tables.length === 0) return;
-
-    window.parent.document.querySelectorAll('[role="gridcell"] input, [role="gridcell"] [contenteditable="true"]').forEach(function(el) {
-      if (el._enterPatched) return;
-      el._enterPatched = true;
-      el.addEventListener('keydown', function(e) {
-        if (e.key === 'Enter' && !e.shiftKey && !e.ctrlKey && !e.metaKey) {
-          e.preventDefault();
-          e.stopPropagation();
-          // Tab キーイベントを発火して横移動
-          var tabEvent = new KeyboardEvent('keydown', {
-            key: 'Tab', code: 'Tab', keyCode: 9, which: 9,
-            bubbles: true, cancelable: true
-          });
-          el.dispatchEvent(tabEvent);
-        }
-      }, true);
-    });
+  var patched = false;
+  function patch() {
+    var doc = window.parent.document;
+    // glide-data-grid のキャンバス or スクロールコンテナを対象にする
+    var containers = doc.querySelectorAll('.dvn-scroller, [class*="data-grid"], canvas');
+    if (!containers.length) return;
+    if (patched) return;
+    patched = true;
+    doc.addEventListener('keydown', function(e) {
+      if (e.key !== 'Enter') return;
+      // data_editor内のセルが編集中かチェック
+      var active = doc.activeElement;
+      var inEditor = active && (
+        active.closest('[data-testid="stDataFrameResizable"]') ||
+        active.closest('.dvn-scroller') ||
+        active.tagName === 'CANVAS'
+      );
+      if (!inEditor) return;
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      // Tab を発火して右セルへ移動
+      active.dispatchEvent(new KeyboardEvent('keydown', {
+        key: 'Tab', code: 'Tab', keyCode: 9, which: 9,
+        bubbles: true, cancelable: true, composed: true
+      }));
+    }, true);
   }
-
-  // DOM変化を監視して都度パッチ適用
-  var observer = new MutationObserver(function() { patchDataEditor(); });
-  observer.observe(window.parent.document.body, { childList: true, subtree: true });
-  setTimeout(patchDataEditor, 800);
-  setTimeout(patchDataEditor, 2000);
+  // MutationObserver で描画完了後に適用
+  var mo = new MutationObserver(function(){ patch(); });
+  mo.observe(window.parent.document.body, {childList:true, subtree:true});
+  setTimeout(patch, 500);
+  setTimeout(patch, 1500);
+  setTimeout(patch, 3000);
 })();
 </script>
 """, height=0)
+
+render_editor()
 st.markdown('</div>', unsafe_allow_html=True)
 
 # ── 金額集計（NaN を 0 に変換してから計算）──
