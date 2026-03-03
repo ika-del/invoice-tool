@@ -5,7 +5,7 @@ import pandas as pd
 from openpyxl import load_workbook
 from datetime import date
 from io import BytesIO
-import os, re
+import os, math
 
 TEMPLATE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "請求書(ひな形）.xlsx")
 MAX_ITEMS = 16
@@ -14,6 +14,14 @@ COLS = ["税区分", "品番", "品名", "数量", "単位", "単価"]
 
 def empty_items():
     return [{"税区分": "10%", "品番": "", "品名": "", "数量": None, "単位": "", "単価": None} for _ in range(MAX_ITEMS)]
+
+def safe_float(v):
+    """NaN・None・空文字を 0.0 に変換"""
+    try:
+        f = float(v)
+        return 0.0 if math.isnan(f) else f
+    except (TypeError, ValueError):
+        return 0.0
 
 st.set_page_config(page_title="請求書入力ツール", page_icon="📄", layout="wide")
 
@@ -46,16 +54,11 @@ st.markdown('</div>', unsafe_allow_html=True)
 st.markdown('<div class="section-box"><div class="section-title">📝 明細（最大16行）</div>', unsafe_allow_html=True)
 st.caption("※ 税区分: 10% = 標準税率 ／ 8% = 軽減税率 ／ 非課税")
 
-# セッション初期化（確実にリストで初期化）
-if "items" not in st.session_state:
+# セッション初期化
+if "items" not in st.session_state or not isinstance(st.session_state["items"], list) or len(st.session_state["items"]) == 0:
     st.session_state["items"] = empty_items()
 
-raw = st.session_state["items"]
-if not isinstance(raw, list):
-    st.session_state["items"] = empty_items()
-    raw = st.session_state["items"]
-
-df = pd.DataFrame(raw, columns=COLS)
+df = pd.DataFrame(st.session_state["items"], columns=COLS)
 for col in COLS:
     if col not in df.columns:
         df[col] = None
@@ -71,7 +74,7 @@ edited = st.data_editor(
         "単位": st.column_config.TextColumn("単位", width="small"),
         "単価": st.column_config.NumberColumn("単価", min_value=0, format="%.0f", width="medium"),
     },
-    use_container_width=True,
+    width="stretch",          # use_container_width=True の代替（廃止対応）
     num_rows="fixed",
     hide_index=True,
     key="item_editor_v3",
@@ -80,14 +83,12 @@ edited = st.data_editor(
 st.session_state["items"] = edited.to_dict("records")
 st.markdown('</div>', unsafe_allow_html=True)
 
+# ── 金額集計（NaN を 0 に変換してから計算）──
 base10 = base8 = exempt = 0.0
 for row in st.session_state["items"]:
-    try:
-        qty = float(row.get("数量") or 0)
-        price = float(row.get("単価") or 0)
-    except (TypeError, ValueError):
-        continue
-    sub = qty * price
+    qty   = safe_float(row.get("数量"))
+    price = safe_float(row.get("単価"))
+    sub   = qty * price
     if sub == 0:
         continue
     tax = row.get("税区分", "10%")
@@ -100,7 +101,7 @@ for row in st.session_state["items"]:
 
 subtotal = base10 + base8 + exempt
 tax10 = int(base10 * 0.10)
-tax8 = int(base8 * 0.08)
+tax8  = int(base8  * 0.08)
 grand = int(subtotal + tax10 + tax8)
 
 st.markdown('<div class="total-box">', unsafe_allow_html=True)
@@ -116,7 +117,7 @@ st.markdown(f'<div class="grand-total">御請求金額（税込）　¥{grand:,.
 st.markdown('</div>', unsafe_allow_html=True)
 
 st.markdown('<div class="section-box"><div class="section-title">📝 備考・支払い条件</div>', unsafe_allow_html=True)
-remarks = st.text_area("", placeholder="例: 翌月末日払い、銀行振込にてお願いいたします。", height=100, label_visibility="collapsed")
+remarks = st.text_area("備考", placeholder="例: 翌月末日払い、銀行振込にてお願いいたします。", height=100, label_visibility="collapsed")
 st.markdown('</div>', unsafe_allow_html=True)
 
 def generate_excel() -> bytes:
@@ -132,20 +133,20 @@ def generate_excel() -> bytes:
     for i, rw in enumerate(st.session_state["items"]):
         r = 22 + i
         hinmei = (rw.get("品名") or "").strip()
-        qty = rw.get("数量")
-        price = rw.get("単価")
+        qty    = rw.get("数量")
+        price  = rw.get("単価")
         if not (hinmei or qty or price):
             for c in range(2, 9):
                 ws.cell(row=r, column=c).value = None
             continue
-        tax = rw.get("税区分", "10%")
+        tax  = rw.get("税区分", "10%")
         code = "8%" if tax == "8%" else "非" if tax == "非課税" else ""
         ws.cell(row=r, column=2).value = code
         ws.cell(row=r, column=3).value = (rw.get("品番") or "").strip() or None
         ws.cell(row=r, column=4).value = hinmei or None
-        ws.cell(row=r, column=5).value = float(qty) if qty else None
+        ws.cell(row=r, column=5).value = safe_float(qty) or None
         ws.cell(row=r, column=6).value = (rw.get("単位") or "").strip() or None
-        ws.cell(row=r, column=7).value = float(price) if price else None
+        ws.cell(row=r, column=7).value = safe_float(price) or None
         ws.cell(row=r, column=8).value = f"=E{r}*G{r}"
     ws["E40"] = '=SUMIF(B22:B37,"8%",H22:H37)'
     ws["G40"] = "=H38-E40-H40"
@@ -164,7 +165,7 @@ with col_l:
 with col_r:
     can_export = bool(client.strip()) and any((r.get("品名") or "").strip() for r in st.session_state["items"])
     if can_export:
-        today_str = date.today().strftime("%Y%m%d")
+        today_str  = date.today().strftime("%Y%m%d")
         default_nm = f"請求書_{today_str}_{client.strip()}.xlsx"
         excel_data = generate_excel()
         st.download_button(
