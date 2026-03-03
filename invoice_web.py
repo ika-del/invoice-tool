@@ -153,7 +153,7 @@ edited = st.data_editor(
     use_container_width=True,
     num_rows="fixed",
     hide_index=True,
-    key="item_editor",
+    key="item_editor_v2",
 )
 
 # 更新を保存
