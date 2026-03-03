@@ -312,4 +312,3 @@ with col_r:
         st.button("📥 Excelを生成してダウンロード",
                   disabled=True, use_container_width=True,
                   help="請求先と明細を1行以上入力してください")
-                  help="請求先と明細を1行以上入力してください")
