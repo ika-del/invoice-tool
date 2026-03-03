@@ -74,13 +74,59 @@ edited = st.data_editor(
         "単位": st.column_config.TextColumn("単位", width="small"),
         "単価": st.column_config.NumberColumn("単価", min_value=0, format="%.0f", width="medium"),
     },
-    width="stretch",          # use_container_width=True の代替（廃止対応）
+    width="stretch",
     num_rows="fixed",
     hide_index=True,
     key="item_editor_v3",
 )
 
-st.session_state["items"] = edited.to_dict("records")
+# ── edited の結果を即座にセッションへ保存（消える問題の防止）──
+new_items = edited.to_dict("records")
+# NaN を None に正規化してからセッションへ
+def normalize_row(row):
+    out = {}
+    for k, v in row.items():
+        if isinstance(v, float) and math.isnan(v):
+            out[k] = None
+        else:
+            out[k] = v
+    return out
+st.session_state["items"] = [normalize_row(r) for r in new_items]
+
+# ── Enterキー → Tab（横移動）に変換する JS ──
+st.components.v1.html("""
+<script>
+(function() {
+  function patchDataEditor() {
+    const tables = window.parent.document.querySelectorAll('[data-testid="stDataFrame"] [role="grid"], .dvn-scroller [role="grid"]');
+    if (tables.length === 0) return;
+
+    window.parent.document.querySelectorAll('[role="gridcell"] input, [role="gridcell"] [contenteditable="true"]').forEach(function(el) {
+      if (el._enterPatched) return;
+      el._enterPatched = true;
+      el.addEventListener('keydown', function(e) {
+        if (e.key === 'Enter' && !e.shiftKey && !e.ctrlKey && !e.metaKey) {
+          e.preventDefault();
+          e.stopPropagation();
+          // Tab キーイベントを発火して横移動
+          var tabEvent = new KeyboardEvent('keydown', {
+            key: 'Tab', code: 'Tab', keyCode: 9, which: 9,
+            bubbles: true, cancelable: true
+          });
+          el.dispatchEvent(tabEvent);
+        }
+      }, true);
+    });
+  }
+
+  // DOM変化を監視して都度パッチ適用
+  var observer = new MutationObserver(function() { patchDataEditor(); });
+  observer.observe(window.parent.document.body, { childList: true, subtree: true });
+  setTimeout(patchDataEditor, 800);
+  setTimeout(patchDataEditor, 2000);
+})();
+</script>
+""", height=0)
 st.markdown('</div>', unsafe_allow_html=True)
 
 # ── 金額集計（NaN を 0 に変換してから計算）──
