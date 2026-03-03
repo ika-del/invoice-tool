@@ -129,7 +129,6 @@ except (ValueError, TypeError):
         for _ in range(MAX_ITEMS)
     ]
     df = pd.DataFrame(st.session_state.items)
-
 edited = st.data_editor(
     df,
     column_config={
