@@ -120,7 +120,15 @@ if "items" not in st.session_state:
 
 import pandas as pd
 
-df = pd.DataFrame(st.session_state.items)
+try:
+    df = pd.DataFrame(st.session_state.items)
+except (ValueError, TypeError):
+    st.session_state.items = [
+        {"税区分": "10%", "品番": "", "品名": "", "数量": None,
+         "単位": "", "単価": None}
+        for _ in range(MAX_ITEMS)
+    ]
+    df = pd.DataFrame(st.session_state.items)
 
 edited = st.data_editor(
     df,
