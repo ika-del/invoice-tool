@@ -82,8 +82,11 @@ st.markdown('</div>', unsafe_allow_html=True)
 
 base10 = base8 = exempt = 0.0
 for row in st.session_state["items"]:
-    qty = row.get("数量") or 0
-    price = row.get("単価") or 0
+    try:
+        qty = float(row.get("数量") or 0)
+        price = float(row.get("単価") or 0)
+    except (TypeError, ValueError):
+        continue
     sub = qty * price
     if sub == 0:
         continue
