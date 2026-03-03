@@ -1,235 +1,354 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+"""
+請求書入力自動化ツール（Streamlit Web版）
+Excel テンプレート（請求書(ひな形）.xlsx）を使って請求書を自動生成します。
+st.data_editor を使わず st.text_input ベースで明細を構築し、
+Enter キーによる rerun で値が消える問題を回避しています。
+"""
+
 import streamlit as st
-import pandas as pd
 from openpyxl import load_workbook
 from datetime import date
-from io import BytesIO
-import os, math
+import os
+import re
+import io
+import math
 
-TEMPLATE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "請求書(ひな形）.xlsx")
+# ---------- 定数 ----------
+_HERE = os.path.dirname(os.path.abspath(__file__))
+TEMPLATE_PATH = os.path.join(_HERE, "請求書(ひな形）.xlsx")
 MAX_ITEMS = 16
 TAX_OPTIONS = ["10%", "8%", "非課税"]
-COLS = ["税区分", "品番", "品名", "数量", "単位", "単価"]
 
-def empty_items():
-    return [{"税区分": "10%", "品番": "", "品名": "", "数量": None, "単位": "", "単価": None} for _ in range(MAX_ITEMS)]
+# ---------- ページ設定 ----------
+st.set_page_config(page_title="請求書入力ツール", layout="wide")
 
-def safe_float(v):
-    """NaN・None・空文字を 0.0 に変換"""
-    try:
-        f = float(v)
-        return 0.0 if math.isnan(f) else f
-    except (TypeError, ValueError):
-        return 0.0
-
-st.set_page_config(page_title="請求書入力ツール", page_icon="📄", layout="wide")
-
+# ---------- CSS ----------
 st.markdown("""
 <style>
-.stApp { font-family: "Hiragino Sans", "Yu Gothic UI", "Meiryo", sans-serif; }
-.main-header { background: linear-gradient(135deg, #1B5E8C 0%, #2980b9 100%); color: white; padding: 1.2rem 1.5rem; border-radius: 10px; margin-bottom: 1.5rem; text-align: center; }
-.main-header h1 { margin: 0; font-size: 1.8rem; font-weight: 700; }
-.main-header p { margin: 0.3rem 0 0 0; font-size: 0.95rem; opacity: 0.85; }
-.section-box { background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 1.2rem; margin-bottom: 1rem; }
-.section-title { color: #1B5E8C; font-size: 1.1rem; font-weight: 700; margin-bottom: 0.8rem; border-bottom: 2px solid #1B5E8C; padding-bottom: 0.3rem; }
-.total-box { background: linear-gradient(135deg, #f0f7ff 0%, #e8f4f8 100%); border: 2px solid #1B5E8C; border-radius: 10px; padding: 1.2rem; margin: 1rem 0; }
-.grand-total { font-size: 1.6rem; font-weight: 800; color: #1B5E8C; text-align: right; }
+/* 明細テーブルのラベル行 */
+div[data-testid="stHorizontalBlock"] .item-header {
+    background: #cce4f0; font-weight: bold; text-align: center;
+    padding: 6px 4px; border-radius: 4px; font-size: 0.85rem;
+}
+/* 入力欄の上マージンを詰める */
+div[data-testid="stVerticalBlock"] > div { gap: 0.25rem; }
+/* 小計列の表示 */
+.subtotal-cell {
+    background: #f0f0f0; border: 1px solid #ddd; border-radius: 4px;
+    padding: 8px 6px; text-align: right; font-size: 0.9rem;
+    min-height: 38px; line-height: 22px;
+}
+/* 合計エリア */
+.total-box {
+    background: #fafafa; border: 1px solid #ddd; border-radius: 4px;
+    padding: 6px 10px; text-align: right; font-size: 1rem;
+}
+.total-box-grand {
+    background: #fafafa; border: 2px solid #333; border-radius: 4px;
+    padding: 6px 10px; text-align: right; font-size: 1.1rem; font-weight: bold;
+}
 </style>
 """, unsafe_allow_html=True)
 
-st.markdown('<div class="main-header"><h1>📄 請求書入力ツール</h1><p>入力して「Excelを生成」ボタンを押すだけ。ブラウザからそのままダウンロードできます。</p></div>', unsafe_allow_html=True)
 
-st.markdown('<div class="section-box"><div class="section-title">📋 基本情報</div>', unsafe_allow_html=True)
-col1, col2 = st.columns(2)
-with col1:
-    client = st.text_input("請求先（御中）*", placeholder="株式会社○○○")
-    invoice_dt = st.date_input("請求日", value=date.today())
-with col2:
-    invoice_no = st.text_input("請求番号", placeholder="INV-2026-001")
-    deadline = st.text_input("支払い期限", placeholder="2026年4月30日")
-subject = st.text_input("件名", placeholder="○○案件に関する請求")
-st.markdown('</div>', unsafe_allow_html=True)
+# ================================================================
+#  セッションステート初期化
+# ================================================================
+def _init_state():
+    today = date.today()
+    defaults = {
+        "client": "",
+        "invoice_no": "",
+        "inv_date": f"{today.year}/{today.month:02d}/{today.day:02d}",
+        "deadline": "",
+        "subject": "",
+        "remarks": "",
+    }
+    for k, v in defaults.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
 
-st.markdown('<div class="section-box"><div class="section-title">📝 明細（最大16行）</div>', unsafe_allow_html=True)
-st.caption("※ 税区分: 10% = 標準税率 ／ 8% = 軽減税率 ／ 非課税")
+    if "items" not in st.session_state:
+        st.session_state["items"] = []
+        for _ in range(MAX_ITEMS):
+            st.session_state["items"].append({
+                "tax": "10%",
+                "hinban": "",
+                "hinmei": "",
+                "qty": "",
+                "unit": "",
+                "price": "",
+            })
 
-# セッション初期化
-if "items" not in st.session_state or not isinstance(st.session_state["items"], list) or len(st.session_state["items"]) == 0:
-    st.session_state["items"] = empty_items()
 
-def normalize_row(row):
-    out = {}
-    for k, v in row.items():
-        if isinstance(v, float) and math.isnan(v):
-            out[k] = None
-        else:
-            out[k] = v
-    return out
+_init_state()
 
-@st.fragment
-def render_editor():
-    df = pd.DataFrame(st.session_state["items"], columns=COLS)
-    for col in COLS:
-        if col not in df.columns:
-            df[col] = None
-    df = df[COLS]
 
-    edited = st.data_editor(
-        df,
-        column_config={
-            "税区分": st.column_config.SelectboxColumn("税区分", options=TAX_OPTIONS, default="10%", width="small"),
-            "品番": st.column_config.TextColumn("品番", width="small"),
-            "品名": st.column_config.TextColumn("品名", width="large"),
-            "数量": st.column_config.NumberColumn("数量", min_value=0, format="%.0f", width="small"),
-            "単位": st.column_config.TextColumn("単位", width="small"),
-            "単価": st.column_config.NumberColumn("単価", min_value=0, format="%.0f", width="medium"),
-        },
-        width="stretch",
-        num_rows="fixed",
-        hide_index=True,
-        key="item_editor_v3",
-    )
-    st.session_state["items"] = [normalize_row(r) for r in edited.to_dict("records")]
+# ================================================================
+#  計算ヘルパー
+# ================================================================
+def _safe_float(s: str) -> float:
+    try:
+        return float(s)
+    except (ValueError, TypeError):
+        return 0.0
 
-    # ── Enterキー → Tab（右移動）変換JS ──
-    # data_editorはiframe内でglide-data-gridを使用。
-    # keydownをキャプチャして Enter を Tab に差し替える。
-    st.components.v1.html("""
-<script>
-(function() {
-  var patched = false;
-  function patch() {
-    var doc = window.parent.document;
-    // glide-data-grid のキャンバス or スクロールコンテナを対象にする
-    var containers = doc.querySelectorAll('.dvn-scroller, [class*="data-grid"], canvas');
-    if (!containers.length) return;
-    if (patched) return;
-    patched = true;
-    doc.addEventListener('keydown', function(e) {
-      if (e.key !== 'Enter') return;
-      // data_editor内のセルが編集中かチェック
-      var active = doc.activeElement;
-      var inEditor = active && (
-        active.closest('[data-testid="stDataFrameResizable"]') ||
-        active.closest('.dvn-scroller') ||
-        active.tagName === 'CANVAS'
-      );
-      if (!inEditor) return;
-      e.preventDefault();
-      e.stopImmediatePropagation();
-      // Tab を発火して右セルへ移動
-      active.dispatchEvent(new KeyboardEvent('keydown', {
-        key: 'Tab', code: 'Tab', keyCode: 9, which: 9,
-        bubbles: true, cancelable: true, composed: true
-      }));
-    }, true);
-  }
-  // MutationObserver で描画完了後に適用
-  var mo = new MutationObserver(function(){ patch(); });
-  mo.observe(window.parent.document.body, {childList:true, subtree:true});
-  setTimeout(patch, 500);
-  setTimeout(patch, 1500);
-  setTimeout(patch, 3000);
-})();
-</script>
-""", height=0)
 
-render_editor()
-st.markdown('</div>', unsafe_allow_html=True)
+def _row_subtotal(row: dict) -> float:
+    return _safe_float(row["qty"]) * _safe_float(row["price"])
 
-# ── 金額集計（NaN を 0 に変換してから計算）──
-base10 = base8 = exempt = 0.0
-for row in st.session_state["items"]:
-    qty   = safe_float(row.get("数量"))
-    price = safe_float(row.get("単価"))
-    sub   = qty * price
-    if sub == 0:
-        continue
-    tax = row.get("税区分", "10%")
-    if tax == "8%":
-        base8 += sub
-    elif tax == "非課税":
-        exempt += sub
-    else:
-        base10 += sub
 
-subtotal = base10 + base8 + exempt
-tax10 = int(base10 * 0.10)
-tax8  = int(base8  * 0.08)
-grand = int(subtotal + tax10 + tax8)
+def _calc_totals():
+    subtotal = base8 = base10 = exempt = 0.0
+    for row in st.session_state["items"]:
+        v = _row_subtotal(row)
+        if v:
+            t = row["tax"]
+            subtotal += v
+            if t == "8%":
+                base8 += v
+            elif t == "非課税":
+                exempt += v
+            else:
+                base10 += v
+    t8 = base8 * 0.08
+    t10 = base10 * 0.10
+    total = subtotal + t8 + t10
+    return {
+        "subtotal": subtotal, "base10": base10, "tax10": t10,
+        "base8": base8, "tax8": t8, "exempt": exempt, "total": total,
+    }
 
-st.markdown('<div class="total-box">', unsafe_allow_html=True)
-c1, c2, c3 = st.columns(3)
-with c1:
-    st.metric("小計", f"¥{subtotal:,.0f}")
-with c2:
-    st.metric("10%対象 → 消費税", f"¥{base10:,.0f} → ¥{tax10:,.0f}")
-    st.metric("8%対象 → 消費税", f"¥{base8:,.0f} → ¥{tax8:,.0f}")
-with c3:
-    st.metric("非課税", f"¥{exempt:,.0f}")
-st.markdown(f'<div class="grand-total">御請求金額（税込）　¥{grand:,.0f}</div>', unsafe_allow_html=True)
-st.markdown('</div>', unsafe_allow_html=True)
 
-st.markdown('<div class="section-box"><div class="section-title">📝 備考・支払い条件</div>', unsafe_allow_html=True)
-remarks = st.text_area("備考", placeholder="例: 翌月末日払い、銀行振込にてお願いいたします。", height=100, label_visibility="collapsed")
-st.markdown('</div>', unsafe_allow_html=True)
+# ================================================================
+#  Excel 書き込み
+# ================================================================
+def _parse_date(s: str):
+    m = re.match(r"(\d{4})[/\-年](\d{1,2})[/\-月](\d{1,2})", s.strip())
+    if m:
+        return int(m.group(1)), int(m.group(2)), int(m.group(3))
+    t = date.today()
+    return t.year, t.month, t.day
 
-def generate_excel() -> bytes:
+
+def _write_excel() -> bytes:
     wb = load_workbook(TEMPLATE_PATH)
     ws = wb.active
-    y, mo, d = invoice_dt.year, invoice_dt.month, invoice_dt.day
+    ss = st.session_state
+
+    # 請求日
+    y, mo, d = _parse_date(ss["inv_date"])
     ws["H4"] = f"請求日　　{y}年{mo:02d}月{d:02d}日"
-    inv = invoice_no.strip()
+
+    # 請求番号
+    inv = ss["invoice_no"].strip()
     ws["H5"] = f"請求番号　{inv}" if inv else "請求番号"
-    ws["C8"] = f"　{client.strip()}　御中"
-    ws["D14"] = subject.strip()
-    ws["E17"] = deadline.strip()
-    for i, rw in enumerate(st.session_state["items"]):
+
+    # 請求先
+    ws["C8"] = f"　{ss['client'].strip()}　御中"
+
+    # 件名
+    ws["D14"] = ss["subject"].strip()
+
+    # 支払い期限
+    ws["E17"] = ss["deadline"].strip()
+
+    # 明細行 (行 22〜37)
+    for i, row in enumerate(ss["items"]):
         r = 22 + i
-        hinmei = (rw.get("品名") or "").strip()
-        qty    = rw.get("数量")
-        price  = rw.get("単価")
-        if not (hinmei or qty or price):
+        hinmei = row["hinmei"].strip()
+        qty_s = row["qty"].strip()
+        price_s = row["price"].strip()
+
+        if not (hinmei or qty_s or price_s):
             for c in range(2, 9):
                 ws.cell(row=r, column=c).value = None
             continue
-        tax  = rw.get("税区分", "10%")
-        code = "8%" if tax == "8%" else "非" if tax == "非課税" else ""
+
+        tax = row["tax"]
+        code = "8%" if tax == "8%" else ("非" if tax == "非課税" else "")
+
         ws.cell(row=r, column=2).value = code
-        ws.cell(row=r, column=3).value = (rw.get("品番") or "").strip() or None
+        ws.cell(row=r, column=3).value = row["hinban"].strip() or None
         ws.cell(row=r, column=4).value = hinmei or None
-        ws.cell(row=r, column=5).value = safe_float(qty) or None
-        ws.cell(row=r, column=6).value = (rw.get("単位") or "").strip() or None
-        ws.cell(row=r, column=7).value = safe_float(price) or None
+
+        try:
+            ws.cell(row=r, column=5).value = float(qty_s) if qty_s else None
+        except ValueError:
+            ws.cell(row=r, column=5).value = None
+
+        ws.cell(row=r, column=6).value = row["unit"].strip() or None
+
+        try:
+            ws.cell(row=r, column=7).value = float(price_s) if price_s else None
+        except ValueError:
+            ws.cell(row=r, column=7).value = None
+
         ws.cell(row=r, column=8).value = f"=E{r}*G{r}"
+
+    # 税計算フォーミュラ
     ws["E40"] = '=SUMIF(B22:B37,"8%",H22:H37)'
     ws["G40"] = "=H38-E40-H40"
-    if remarks.strip():
-        ws["B39"] = remarks.strip()
-    buf = BytesIO()
+
+    # 備考
+    remarks = ss["remarks"].strip()
+    if remarks:
+        ws["B39"] = remarks
+
+    buf = io.BytesIO()
     wb.save(buf)
     return buf.getvalue()
 
-st.markdown("---")
-col_l, col_r = st.columns([1, 1])
-with col_l:
-    if st.button("🗑️ フォームをクリア", use_container_width=True):
-        st.session_state["items"] = empty_items()
+
+# ================================================================
+#  UI
+# ================================================================
+st.title("請求書入力ツール")
+
+# ---------- 基本情報 ----------
+with st.container():
+    st.subheader("基本情報")
+    c1, c2 = st.columns(2)
+    with c1:
+        st.session_state["client"] = st.text_input(
+            "請求先（御中）*", value=st.session_state["client"], key="w_client")
+        st.session_state["inv_date"] = st.text_input(
+            "請求日 (YYYY/MM/DD)", value=st.session_state["inv_date"], key="w_date")
+        st.session_state["subject"] = st.text_input(
+            "件名", value=st.session_state["subject"], key="w_subject")
+    with c2:
+        st.session_state["invoice_no"] = st.text_input(
+            "請求番号", value=st.session_state["invoice_no"], key="w_invno")
+        st.session_state["deadline"] = st.text_input(
+            "支払い期限 (例: 2024年3月31日)",
+            value=st.session_state["deadline"], key="w_deadline")
+
+# ---------- 明細テーブル ----------
+st.subheader("明細")
+st.caption("※ 税区分: 10% = 標準税率（無記入と同じ）／ 8% = 軽減税率 ／ 非課税")
+
+# ヘッダー行
+hcols = st.columns([1.0, 1.2, 3.0, 1.0, 0.8, 1.4, 1.4])
+headers = ["税区分", "品番", "品名・品番", "数量", "単位", "単価", "小計"]
+for col, label in zip(hcols, headers):
+    col.markdown(f'<div class="item-header">{label}</div>', unsafe_allow_html=True)
+
+# 各明細行
+for i in range(MAX_ITEMS):
+    row = st.session_state["items"][i]
+    cols = st.columns([1.0, 1.2, 3.0, 1.0, 0.8, 1.4, 1.4])
+
+    with cols[0]:
+        row["tax"] = st.selectbox(
+            f"税{i}", TAX_OPTIONS,
+            index=TAX_OPTIONS.index(row["tax"]),
+            key=f"tax_{i}", label_visibility="collapsed")
+    with cols[1]:
+        row["hinban"] = st.text_input(
+            f"品番{i}", value=row["hinban"],
+            key=f"hinban_{i}", label_visibility="collapsed")
+    with cols[2]:
+        row["hinmei"] = st.text_input(
+            f"品名{i}", value=row["hinmei"],
+            key=f"hinmei_{i}", label_visibility="collapsed")
+    with cols[3]:
+        row["qty"] = st.text_input(
+            f"数量{i}", value=row["qty"],
+            key=f"qty_{i}", label_visibility="collapsed")
+    with cols[4]:
+        row["unit"] = st.text_input(
+            f"単位{i}", value=row["unit"],
+            key=f"unit_{i}", label_visibility="collapsed")
+    with cols[5]:
+        row["price"] = st.text_input(
+            f"単価{i}", value=row["price"],
+            key=f"price_{i}", label_visibility="collapsed")
+    with cols[6]:
+        sub = _row_subtotal(row)
+        display = f"¥{sub:,.0f}" if sub else ""
+        cols[6].markdown(
+            f'<div class="subtotal-cell">{display}</div>',
+            unsafe_allow_html=True)
+
+# ---------- 合計 ----------
+st.subheader("合計（自動計算）")
+totals = _calc_totals()
+
+tc1, tc2, tc3 = st.columns(3)
+with tc1:
+    st.markdown("**小計**")
+    st.markdown(f'<div class="total-box">¥{totals["subtotal"]:,.0f}</div>',
+                unsafe_allow_html=True)
+with tc2:
+    st.markdown("**10%対象**")
+    st.markdown(f'<div class="total-box">¥{totals["base10"]:,.0f}</div>',
+                unsafe_allow_html=True)
+    st.markdown("**8%対象**")
+    st.markdown(f'<div class="total-box">¥{totals["base8"]:,.0f}</div>',
+                unsafe_allow_html=True)
+    st.markdown("**非課税**")
+    st.markdown(f'<div class="total-box">¥{totals["exempt"]:,.0f}</div>',
+                unsafe_allow_html=True)
+with tc3:
+    st.markdown("**消費税(10%)**")
+    st.markdown(f'<div class="total-box">¥{totals["tax10"]:,.0f}</div>',
+                unsafe_allow_html=True)
+    st.markdown("**消費税(8%)**")
+    st.markdown(f'<div class="total-box">¥{totals["tax8"]:,.0f}</div>',
+                unsafe_allow_html=True)
+
+st.divider()
+st.markdown("### 御請求金額（税込）")
+st.markdown(f'<div class="total-box-grand">¥{totals["total"]:,.0f}</div>',
+            unsafe_allow_html=True)
+
+# ---------- 備考 ----------
+st.subheader("備考・支払い条件")
+st.session_state["remarks"] = st.text_area(
+    "備考", value=st.session_state["remarks"], key="w_remarks",
+    placeholder="例: 翌月末日払い、銀行振込にてお願いいたします。", height=120)
+
+# ---------- ボタン ----------
+st.divider()
+btn_cols = st.columns([1, 1, 4])
+
+with btn_cols[0]:
+    if st.button("フォームをクリア", use_container_width=True):
+        today = date.today()
+        st.session_state["client"] = ""
+        st.session_state["invoice_no"] = ""
+        st.session_state["inv_date"] = f"{today.year}/{today.month:02d}/{today.day:02d}"
+        st.session_state["deadline"] = ""
+        st.session_state["subject"] = ""
+        st.session_state["remarks"] = ""
+        for row in st.session_state["items"]:
+            row["tax"] = "10%"
+            for k in ("hinban", "hinmei", "qty", "unit", "price"):
+                row[k] = ""
         st.rerun()
-with col_r:
-    can_export = bool(client.strip()) and any((r.get("品名") or "").strip() for r in st.session_state["items"])
-    if can_export:
-        today_str  = date.today().strftime("%Y%m%d")
-        default_nm = f"請求書_{today_str}_{client.strip()}.xlsx"
-        excel_data = generate_excel()
+
+with btn_cols[1]:
+    # バリデーション
+    client_ok = bool(st.session_state["client"].strip())
+    has_item = any(r["hinmei"].strip() for r in st.session_state["items"])
+    can_export = client_ok and has_item
+
+    if not can_export:
+        st.button("Excel 出力", use_container_width=True, disabled=True)
+        if not client_ok:
+            st.caption("⚠ 請求先を入力してください")
+        elif not has_item:
+            st.caption("⚠ 明細を1行以上入力してください")
+    else:
+        today_str = date.today().strftime("%Y%m%d")
+        filename = f"請求書_{today_str}_{st.session_state['client'].strip()}.xlsx"
+        excel_bytes = _write_excel()
         st.download_button(
-            label="📥 Excelを生成してダウンロード",
-            data=excel_data,
-            file_name=default_nm,
+            label="Excel 出力",
+            data=excel_bytes,
+            file_name=filename,
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             use_container_width=True,
-            type="primary",
         )
-    else:
-        st.button("📥 Excelを生成してダウンロード", disabled=True, use_container_width=True, help="請求先と明細を1行以上入力してください")
